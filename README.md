@@ -39,6 +39,18 @@ Damage classification is based on:
 - Swipe comparison UI (before vs after)
 
 ---
+## Results
+
+This map shows detected damage based on spectral change analysis using Sentinel-2 imagery.
+
+<p align="center">
+  <img width="1170" height="1244" alt="Gaza_destruction_zoom" src="https://github.com/user-attachments/assets/8762fc98-fee7-4813-b760-78c2bb5329b9" />
+</p>
+
+**Legend:**
+- 🔴 Completely destroyed  
+- 🟠 Semi-destroyed  
+- 🟢 Not destroyed  
 
 ## Requirements
 
