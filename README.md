@@ -65,4 +65,8 @@ Results depend on thresholds and data quality.
 
 ## License
 
-MIT License (or specify your own)
+MIT License
+
+Copyright (c) 2026 Amit Kumar Basukala
+
+Permission is hereby granted...
