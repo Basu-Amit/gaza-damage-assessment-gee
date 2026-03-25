@@ -1,0 +1,424 @@
+/*
+Gaza Damage Assessment (Google Earth Engine)
+Pre- and post-October 7, 2023 comparison using NDVI, NDBI, and Cloud Score+.
+
+Author: Amit Kumar Basukala
+Reference: If you use or adapt this script, please cite/credit Amit Kumar Basukala.
+Notes:
+- Define `aoi` in the Earth Engine editor before running this script.
+- This script classifies areas into:
+  0 = Not destroyed
+  1 = Semi-destroyed
+  2 = Completely destroyed
+*/
+
+// ---------------------------
+// 1. SETTINGS
+// ---------------------------
+
+// Convert AOI geometry to a FeatureCollection for shapefile export.
+var aoiFeature = ee.Feature(aoi, {
+  name: 'Gaza_AOI',
+  type: 'polygon'
+});
+var aoiCollection = ee.FeatureCollection([aoiFeature]);
+
+// Time periods.
+// Note: Earth Engine's filterDate end date is exclusive.
+// Using 2026-03-26 includes imagery up to 2026-03-25.
+var beforeStart = '2023-01-01';
+var beforeEnd   = '2023-10-06';
+
+var afterStart  = '2025-01-07';
+var afterEnd    = '2026-03-26';
+
+var exportFolder = 'GEE_Exports';
+var scale = 10; // Sentinel-2 resolution in meters
+
+// Thresholds. Adjust these if needed for your study area.
+var csThreshold = 0.60;
+var ndbiStrongIncrease = 0.12;
+var ndbiModerateIncrease = 0.06;
+var ndviStrongDecrease = -0.20;
+var ndviModerateDecrease = -0.10;
+
+
+// ---------------------------
+// 2. DATA
+// ---------------------------
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+
+// Join Sentinel-2 with Cloud Score+ by system:index.
+var joined = ee.Join.saveFirst('cloud_score').apply({
+  primary: s2,
+  secondary: csPlus,
+  condition: ee.Filter.equals({
+    leftField: 'system:index',
+    rightField: 'system:index'
+  })
+});
+
+
+// ---------------------------
+// 3. HELPER FUNCTIONS
+// ---------------------------
+
+// Add Cloud Score+ band and keep clearer pixels only.
+function addCloudScoreMask(image) {
+  var csImage = ee.Image(image.get('cloud_score'));
+  var csBand = csImage.select('cs_cdf');
+
+  return ee.Image(image)
+    .addBands(csBand.rename('cloudscore'))
+    .updateMask(csBand.gte(csThreshold))
+    .copyProperties(image, image.propertyNames());
+}
+
+// Build a median composite for a date range.
+function getComposite(startDate, endDate) {
+  return ee.ImageCollection(joined)
+    .filterDate(startDate, endDate)
+    .filterBounds(aoi)
+    .filter(ee.Filter.notNull(['cloud_score']))
+    .map(addCloudScoreMask)
+    .median()
+    .clip(aoi);
+}
+
+// Create a legend row.
+function makeRow(color, label) {
+  var colorBox = ui.Label('', {
+    backgroundColor: color,
+    padding: '8px',
+    margin: '0 8px 4px 0'
+  });
+
+  var text = ui.Label(label, {
+    margin: '0 0 4px 0',
+    fontSize: '13px'
+  });
+
+  return ui.Panel([colorBox, text], ui.Panel.Layout.Flow('horizontal'));
+}
+
+
+// ---------------------------
+// 4. COMPOSITES AND INDICES
+// ---------------------------
+
+var beforeImage = getComposite(beforeStart, beforeEnd);
+var afterImage = getComposite(afterStart, afterEnd);
+
+// NDVI = (NIR - Red) / (NIR + Red)
+var ndviBefore = beforeImage.normalizedDifference(['B8', 'B4']).rename('NDVI_Before');
+var ndviAfter = afterImage.normalizedDifference(['B8', 'B4']).rename('NDVI_After');
+
+// NDBI = (SWIR - NIR) / (SWIR + NIR)
+var ndbiBefore = beforeImage.normalizedDifference(['B12', 'B8']).rename('NDBI_Before');
+var ndbiAfter = afterImage.normalizedDifference(['B12', 'B8']).rename('NDBI_After');
+
+// Change images
+var ndviChange = ndviAfter.subtract(ndviBefore).rename('NDVI_Change');
+var ndbiChange = ndbiAfter.subtract(ndbiBefore).rename('NDBI_Change');
+
+
+// ---------------------------
+// 5. DAMAGE CLASSIFICATION
+// ---------------------------
+
+// Rules:
+// Completely destroyed: strong NDBI increase + strong NDVI decrease
+// Semi-destroyed: moderate NDBI increase + moderate NDVI decrease
+var completelyDestroyed = ndbiChange.gte(ndbiStrongIncrease)
+  .and(ndviChange.lte(ndviStrongDecrease));
+
+var semiDestroyed = ndbiChange.gte(ndbiModerateIncrease)
+  .and(ndviChange.lte(ndviModerateDecrease))
+  .and(completelyDestroyed.not());
+
+// Reduce confusion from water/shadow by keeping likely built-up areas.
+var builtMask = ndbiBefore.gt(-0.15).or(ndbiAfter.gt(-0.15));
+
+completelyDestroyed = completelyDestroyed.and(builtMask);
+semiDestroyed = semiDestroyed.and(builtMask);
+
+// Final class image:
+// 0 = Not destroyed
+// 1 = Semi-destroyed
+// 2 = Completely destroyed
+var destructionClass = ee.Image(0)
+  .where(semiDestroyed, 1)
+  .where(completelyDestroyed, 2)
+  .rename('Destruction_Class')
+  .clip(aoi);
+
+// Masks for display
+var notDestroyedMask = destructionClass.eq(0).selfMask();
+var semiMask = destructionClass.eq(1).selfMask();
+var completeMask = destructionClass.eq(2).selfMask();
+
+
+// ---------------------------
+// 6. AREA STATISTICS
+// ---------------------------
+
+var pixelAreaKm2 = ee.Image.pixelArea().divide(1e6);
+
+var semiArea = semiMask.multiply(pixelAreaKm2).rename('semi_km2');
+var completeArea = completeMask.multiply(pixelAreaKm2).rename('complete_km2');
+
+var semiKm2 = ee.Number(semiArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: scale,
+  maxPixels: 1e13,
+  tileScale: 4
+}).get('semi_km2'));
+
+var completeKm2 = ee.Number(completeArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: scale,
+  maxPixels: 1e13,
+  tileScale: 4
+}).get('complete_km2'));
+
+var aoiKm2 = aoi.area().divide(1e6);
+var totalDestroyedKm2 = semiKm2.add(completeKm2);
+var destroyedPercent = totalDestroyedKm2.divide(aoiKm2).multiply(100);
+
+print('Semi-destroyed area (km²):', semiKm2);
+print('Completely destroyed area (km²):', completeKm2);
+print('Total destroyed area (km²):', totalDestroyedKm2);
+print('AOI area (km²):', aoiKm2);
+print('Destroyed area (% of AOI):', destroyedPercent);
+
+
+// ---------------------------
+// 7. VISUALIZATION
+// ---------------------------
+
+var rgbVis = {
+  bands: ['B12', 'B8', 'B4'],
+  min: 0.02,
+  max: 0.35
+};
+
+var ndviVis = {
+  min: -0.5,
+  max: 0.8,
+  palette: ['brown', 'yellow', 'green']
+};
+
+var ndbiVis = {
+  min: -0.5,
+  max: 0.5,
+  palette: ['blue', 'white', 'red']
+};
+
+
+// ---------------------------
+// 8. EXPORTS
+// ---------------------------
+
+// Export class raster
+Export.image.toDrive({
+  image: destructionClass.toByte(),
+  description: 'Destruction_Classification',
+  folder: exportFolder,
+  fileNamePrefix: 'destruction_classification',
+  region: aoi,
+  scale: scale,
+  maxPixels: 1e13
+});
+
+// Export NDVI change
+Export.image.toDrive({
+  image: ndviChange,
+  description: 'NDVI_Change',
+  folder: exportFolder,
+  fileNamePrefix: 'ndvi_change',
+  region: aoi,
+  scale: scale,
+  maxPixels: 1e13
+});
+
+// Export NDBI change
+Export.image.toDrive({
+  image: ndbiChange,
+  description: 'NDBI_Change',
+  folder: exportFolder,
+  fileNamePrefix: 'ndbi_change',
+  region: aoi,
+  scale: scale,
+  maxPixels: 1e13
+});
+
+// Export summary statistics as CSV
+var statsFeature = ee.Feature(null, {
+  author: 'Amit Kumar Basukala',
+  before_start: beforeStart,
+  before_end: beforeEnd,
+  after_start: afterStart,
+  after_end: afterEnd,
+  cloudscore_threshold: csThreshold,
+  ndbi_strong_increase: ndbiStrongIncrease,
+  ndbi_moderate_increase: ndbiModerateIncrease,
+  ndvi_strong_decrease: ndviStrongDecrease,
+  ndvi_moderate_decrease: ndviModerateDecrease,
+  semi_destroyed_km2: semiKm2,
+  completely_destroyed_km2: completeKm2,
+  total_destroyed_km2: totalDestroyedKm2,
+  aoi_km2: aoiKm2,
+  destroyed_percent: destroyedPercent
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection([statsFeature]),
+  description: 'Destruction_Statistics',
+  folder: exportFolder,
+  fileNamePrefix: 'destruction_statistics',
+  fileFormat: 'CSV'
+});
+
+// Export AOI shapefile
+Export.table.toDrive({
+  collection: aoiCollection,
+  description: 'Gaza_AOI_Shapefile',
+  folder: exportFolder,
+  fileFormat: 'SHP'
+});
+
+
+// ---------------------------
+// 9. SWIPE MAP UI
+// ---------------------------
+
+var leftMap = ui.Map();
+var rightMap = ui.Map();
+
+leftMap.centerObject(aoi, 11);
+rightMap.centerObject(aoi, 11);
+
+// Left map: before
+leftMap.addLayer(beforeImage, rgbVis, 'Before RGB');
+leftMap.addLayer(ndviBefore, ndviVis, 'Before NDVI', false);
+leftMap.addLayer(ndbiBefore, ndbiVis, 'Before NDBI', false);
+leftMap.addLayer(aoi, {color: 'yellow'}, 'AOI', true, 0.8);
+
+// Right map: after
+rightMap.addLayer(afterImage, rgbVis, 'After RGB');
+rightMap.addLayer(ndviAfter, ndviVis, 'After NDVI', false);
+rightMap.addLayer(ndbiAfter, ndbiVis, 'After NDBI', false);
+rightMap.addLayer(notDestroyedMask, {palette: ['00AA00'], opacity: 0.20}, 'Not destroyed', false);
+rightMap.addLayer(semiMask, {palette: ['FFA500']}, 'Semi-destroyed');
+rightMap.addLayer(completeMask, {palette: ['FF0000']}, 'Completely destroyed');
+rightMap.addLayer(aoi, {color: 'yellow'}, 'AOI', true, 0.8);
+
+// Link maps and add swipe panel
+ui.Map.Linker([leftMap, rightMap]);
+
+leftMap.add(ui.Label('BEFORE: ' + beforeStart + ' to ' + beforeEnd, {
+  position: 'top-left',
+  fontWeight: 'bold',
+  fontSize: '14px',
+  backgroundColor: 'rgba(255,255,255,0.8)',
+  padding: '4px'
+}));
+
+rightMap.add(ui.Label('AFTER: ' + afterStart + ' to ' + afterEnd, {
+  position: 'top-right',
+  fontWeight: 'bold',
+  fontSize: '14px',
+  backgroundColor: 'rgba(255,255,255,0.8)',
+  padding: '4px'
+}));
+
+var splitPanel = ui.SplitPanel({
+  firstPanel: leftMap,
+  secondPanel: rightMap,
+  wipe: true,
+  style: {stretch: 'both'}
+});
+
+ui.root.clear();
+ui.root.add(splitPanel);
+
+
+// ---------------------------
+// 10. LEGEND
+// ---------------------------
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '10px 12px',
+    backgroundColor: 'rgba(255,255,255,0.9)'
+  }
+});
+
+legend.add(ui.Label({
+  value: 'Destruction Legend',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '15px',
+    margin: '0 0 8px 0'
+  }
+}));
+
+legend.add(makeRow('#FF0000', 'Completely destroyed'));
+legend.add(makeRow('#FFA500', 'Semi-destroyed'));
+legend.add(makeRow('#00AA00', 'Not destroyed'));
+
+legend.add(ui.Label({
+  value: 'Method: NDBI increase + NDVI decrease',
+  style: {
+    fontSize: '11px',
+    color: 'gray',
+    margin: '8px 0 0 0'
+  }
+}));
+
+rightMap.add(legend);
+
+
+// ---------------------------
+// 11. SUMMARY PANEL
+// ---------------------------
+
+var statsPanel = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '10px 12px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    width: '280px'
+  }
+});
+
+statsPanel.add(ui.Label({
+  value: 'Damage Summary',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '15px',
+    margin: '0 0 8px 0'
+  }
+}));
+
+semiKm2.evaluate(function(semiVal) {
+  completeKm2.evaluate(function(completeVal) {
+    totalDestroyedKm2.evaluate(function(totalVal) {
+      destroyedPercent.evaluate(function(percentVal) {
+        statsPanel.add(ui.Label('Semi-destroyed: ' + (semiVal || 0).toFixed(3) + ' km²'));
+        statsPanel.add(ui.Label('Completely destroyed: ' + (completeVal || 0).toFixed(3) + ' km²'));
+        statsPanel.add(ui.Label('Total destroyed: ' + (totalVal || 0).toFixed(3) + ' km²'));
+        statsPanel.add(ui.Label('Destroyed % of AOI: ' + (percentVal || 0).toFixed(2) + '%'));
+        statsPanel.add(ui.Label('Cloud Score+ threshold: ' + csThreshold));
+        statsPanel.add(ui.Label('Check the Tasks tab to run exports.'));
+      });
+    });
+  });
+});
+
+rightMap.add(statsPanel);
